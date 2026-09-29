@@ -1,0 +1,44 @@
+# hello-world.yaml - en enkel pod som svarar på HTTP.
+# Ingen nodeSelector: att den hamnar på en worker beror helt på att servrarna
+# är taintade CriticalAddonsOnly=true:NoExecute.
+#
+#   kubectl --kubeconfig kubeconfig apply -f k8s/hello-world.yaml
+#   kubectl --kubeconfig kubeconfig get pod hello-world -o wide
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hello-world
+  labels:
+    app: hello-world
+spec:
+  containers:
+    - name: http-echo
+      image: hashicorp/http-echo:1.0
+      args:
+        - "-listen=:5678"
+        - "-text=hello from k3s"
+      ports:
+        - containerPort: 5678
+          name: http
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          memory: 32Mi
+      readinessProbe:
+        httpGet:
+          path: /
+          port: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello-world
+spec:
+  selector:
+    app: hello-world
+  ports:
+    - port: 80
+      targetPort: http

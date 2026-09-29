@@ -1,0 +1,20 @@
+# hemligheter och genererat
+kubeconfig
+ansible/inventory.ini
+infra/cloud-init.rendered.yaml
+
+# python
+__pycache__/
+*.pyc
+
+# guardens audit-logg
+.claude/hooks/audit-log.jsonl
+
+# staging för hook-förslag tas bort efter inkopiering
+# .claude/hooks-proposed/
+
+# macOS
+.DS_Store
+
+# råa skärmdumpar (originalen till de namngivna i screenshots/)
+screenshots/Skärmavbild*

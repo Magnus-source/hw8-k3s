@@ -1,0 +1,217 @@
+---
+# site.yml - installerar ett k3s-kluster med 3 dedikerade control-plane-noder
+# (inbäddad etcd) och 3 workers. Fem plays, inga roller.
+#
+#   cd ansible && ansible-playbook site.yml
+#
+# Idempotent: körs playbooken igen installeras inget om, config-filer skrivs
+# bara om vid ändring (och k3s startas då om via handler).
+
+# ---------------------------------------------------------------------------
+# 1. Förbered alla noder
+# ---------------------------------------------------------------------------
+- name: Förbered alla noder
+  hosts: k3s
+  tasks:
+    - name: Vänta tills cloud-init är klar
+      ansible.builtin.command: cloud-init status --wait
+      changed_when: false
+      failed_when: false
+
+    - name: Installera curl
+      ansible.builtin.apt:
+        name: curl
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Skapa k3s config-katalog
+      ansible.builtin.file:
+        path: "{{ k3s_config_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Kolla om installern redan finns
+      ansible.builtin.stat:
+        path: "{{ k3s_installer }}"
+      register: installer
+
+    # get.k3s.io kan ligga nere (svarade HTTP 500 vid första körningen 2026-09-29).
+    # Samma skript finns i k3s-repot på GitHub, så vi faller tillbaka dit.
+    - name: Hämta k3s-installern
+      when: not installer.stat.exists
+      block:
+        - name: Hämta k3s-installern från get.k3s.io
+          ansible.builtin.get_url:
+            url: "{{ k3s_installer_url }}"
+            dest: "{{ k3s_installer }}"
+            mode: "0755"
+      rescue:
+        - name: Hämta k3s-installern från GitHub-spegeln
+          ansible.builtin.get_url:
+            url: "{{ k3s_installer_mirror }}"
+            dest: "{{ k3s_installer }}"
+            mode: "0755"
+
+# ---------------------------------------------------------------------------
+# 2. server1 startar klustret (cluster-init = inbäddad etcd)
+# ---------------------------------------------------------------------------
+- name: server1 - initiera klustret
+  hosts: server1
+  handlers:
+    - name: restart k3s
+      ansible.builtin.service:
+        name: k3s
+        state: restarted
+  tasks:
+    - name: Skriv k3s config.yaml (cluster-init)
+      ansible.builtin.copy:
+        dest: "{{ k3s_config_dir }}/config.yaml"
+        mode: "0600"
+        content: |
+          cluster-init: true
+          node-taint:
+            - "{{ server_taint }}"
+          tls-san:
+            - "{{ ansible_host }}"
+          write-kubeconfig-mode: "0644"
+      notify: restart k3s
+
+    - name: Installera k3s server
+      ansible.builtin.command: sh {{ k3s_installer }}
+      environment:
+        INSTALL_K3S_CHANNEL: "{{ k3s_channel }}"
+      args:
+        creates: /usr/local/bin/k3s
+
+    - name: Vänta på API-servern
+      ansible.builtin.wait_for:
+        port: 6443
+        timeout: 300
+
+    - name: Vänta på join-token
+      ansible.builtin.wait_for:
+        path: "{{ k3s_token_file }}"
+        timeout: 120
+
+# ---------------------------------------------------------------------------
+# 3. server2 och server3 joinar control plane, en i taget
+# ---------------------------------------------------------------------------
+- name: server2/3 - joina control plane
+  hosts: servers:!server1
+  serial: 1
+  handlers:
+    - name: restart k3s
+      ansible.builtin.service:
+        name: k3s
+        state: restarted
+  tasks:
+    - name: Läs join-token från server1
+      ansible.builtin.slurp:
+        src: "{{ k3s_token_file }}"
+      delegate_to: server1
+      register: token_raw
+      no_log: true
+
+    - name: Skriv k3s config.yaml (server join)
+      ansible.builtin.copy:
+        dest: "{{ k3s_config_dir }}/config.yaml"
+        mode: "0600"
+        content: |
+          server: "{{ k3s_server_url }}"
+          token: "{{ token_raw.content | b64decode | trim }}"
+          node-taint:
+            - "{{ server_taint }}"
+          tls-san:
+            - "{{ ansible_host }}"
+      no_log: true
+      notify: restart k3s
+
+    - name: Installera k3s server
+      ansible.builtin.command: sh {{ k3s_installer }}
+      environment:
+        INSTALL_K3S_CHANNEL: "{{ k3s_channel }}"
+      args:
+        creates: /usr/local/bin/k3s
+
+    - name: Vänta på lokal API-server
+      ansible.builtin.wait_for:
+        port: 6443
+        timeout: 300
+
+# ---------------------------------------------------------------------------
+# 4. Workers joinar som agents
+# ---------------------------------------------------------------------------
+- name: agents - joina som workers
+  hosts: agents
+  handlers:
+    - name: restart k3s-agent
+      ansible.builtin.service:
+        name: k3s-agent
+        state: restarted
+  tasks:
+    - name: Läs join-token från server1
+      ansible.builtin.slurp:
+        src: "{{ k3s_token_file }}"
+      delegate_to: server1
+      register: token_raw
+      no_log: true
+
+    - name: Skriv k3s config.yaml (agent)
+      ansible.builtin.copy:
+        dest: "{{ k3s_config_dir }}/config.yaml"
+        mode: "0600"
+        content: |
+          server: "{{ k3s_server_url }}"
+          token: "{{ token_raw.content | b64decode | trim }}"
+      no_log: true
+      notify: restart k3s-agent
+
+    - name: Installera k3s agent
+      ansible.builtin.command: sh {{ k3s_installer }}
+      environment:
+        INSTALL_K3S_CHANNEL: "{{ k3s_channel }}"
+        INSTALL_K3S_EXEC: agent
+      args:
+        creates: /usr/local/bin/k3s
+
+# ---------------------------------------------------------------------------
+# 5. Verifiera och hämta kubeconfig till laptopen
+# ---------------------------------------------------------------------------
+- name: Kubeconfig och verifiering
+  hosts: server1
+  tags: kubeconfig
+  tasks:
+    - name: Vänta tills alla {{ expected_nodes }} noder är Ready
+      ansible.builtin.command: k3s kubectl get nodes --no-headers
+      register: nodes
+      changed_when: false
+      retries: 60
+      delay: 10
+      until: nodes.stdout_lines | select('search', '\sReady\s') | list | length == expected_nodes | int
+
+    - name: Läs kubeconfig från server1
+      ansible.builtin.slurp:
+        src: "{{ k3s_config_dir }}/k3s.yaml"
+      register: kubeconfig_raw
+      no_log: true
+
+    # slurp + copy i stället för fetch + replace: copy jämför innehåll och
+    # rapporterar bara changed när kubeconfig faktiskt ändrats.
+    - name: Skriv kubeconfig till projektroten (server-adress = server1)
+      ansible.builtin.copy:
+        dest: "{{ kubeconfig_local }}"
+        mode: "0600"
+        content: "{{ kubeconfig_raw.content | b64decode | replace('https://127.0.0.1:6443', k3s_server_url) }}"
+      delegate_to: localhost
+      become: false
+      no_log: true
+
+    - name: Visa noder
+      ansible.builtin.command: k3s kubectl get nodes -o wide
+      changed_when: false
+      register: nodes_wide
+
+    - name: Klusterstatus
+      ansible.builtin.debug:
+        msg: "{{ nodes_wide.stdout_lines }}"

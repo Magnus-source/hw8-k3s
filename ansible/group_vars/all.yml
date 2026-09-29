@@ -1,0 +1,21 @@
+---
+# Gemensamma variabler för site.yml.
+k3s_channel: stable                       # https://update.k3s.io/v1-release/channels
+k3s_config_dir: /etc/rancher/k3s
+k3s_installer: /tmp/k3s-install.sh
+k3s_installer_url: https://get.k3s.io
+k3s_installer_mirror: https://raw.githubusercontent.com/k3s-io/k3s/master/install.sh
+k3s_token_file: /var/lib/rancher/k3s/server/token
+
+# Servrarna ska bara köra control plane + etcd. NoExecute gör att inga vanliga
+# pods hamnar där. Systemkomponenter i k3s (coredns, traefik, metrics-server,
+# local-path) tolererar INTE tainten och hamnar därför på workers.
+server_taint: "CriticalAddonsOnly=true:NoExecute"
+
+server1_ip: "{{ hostvars['server1'].ansible_host }}"
+k3s_server_url: "https://{{ server1_ip }}:6443"
+
+# Dit kubeconfig hämtas på laptopen (projektroten, gitignored).
+kubeconfig_local: "{{ playbook_dir }}/../kubeconfig"
+
+expected_nodes: "{{ groups['servers'] | length + groups['agents'] | length }}"

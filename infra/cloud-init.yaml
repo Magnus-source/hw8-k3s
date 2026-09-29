@@ -1,0 +1,9 @@
+#cloud-config
+# Mall. create-vms.sh byter ut __SSH_PUB_KEY__ mot innehållet i din publika
+# nyckel och skriver resultatet till infra/cloud-init.rendered.yaml (gitignored).
+# Standardanvändaren i Multipass Ubuntu-avbildningar heter "ubuntu".
+ssh_authorized_keys:
+  - __SSH_PUB_KEY__
+package_update: true
+packages:
+  - curl

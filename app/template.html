@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="sv">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Guard Dashboard</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --fg: #1c1f24; --muted: #5d6470; --line: #e3e6ea;
+    --allow: #1f7a4d; --allow-bg: #e3f4ea;
+    --ask: #9a6400; --ask-bg: #fff3d6;
+    --deny: #b3261e; --deny-bg: #fbe4e2;
+    --ok: #1f7a4d; --fail: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a; --card: #1d2026; --fg: #e8eaee; --muted: #9aa3ad; --line: #2c3037;
+      --allow: #6fd39a; --allow-bg: #173324;
+      --ask: #ffcc66; --ask-bg: #3a2d10;
+      --deny: #ff8a80; --deny-bg: #3d1a18;
+      --ok: #6fd39a; --fail: #ff8a80;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 26px; margin: 0 0 4px; }
+  h2 { font-size: 18px; margin: 32px 0 10px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .summary { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 8px; }
+  .pill { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; min-width: 150px; }
+  .pill b { display: block; font-size: 22px; }
+  .pill span { color: var(--muted); font-size: 13px; }
+  .pill.pass b { color: var(--ok); } .pill.fail b { color: var(--fail); }
+  table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  th, td { text-align: left; padding: 8px 10px; border-top: 1px solid var(--line); vertical-align: top; }
+  th { background: var(--bg); font-weight: 600; font-size: 13px; color: var(--muted); border-top: none; }
+  code { font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+  .lvl { display: inline-block; font-size: 12px; font-weight: 600; letter-spacing: .04em; padding: 2px 8px; border-radius: 999px; text-transform: uppercase; }
+  .lvl.allow { color: var(--allow); background: var(--allow-bg); }
+  .lvl.ask   { color: var(--ask);   background: var(--ask-bg); }
+  .lvl.deny  { color: var(--deny);  background: var(--deny-bg); }
+  .mark { font-weight: 700; }
+  .mark.ok { color: var(--ok); } .mark.fail { color: var(--fail); }
+  tr.fail td { background: var(--deny-bg); }
+  details { margin-top: 10px; }
+  summary { cursor: pointer; color: var(--muted); }
+  footer { color: var(--muted); font-size: 13px; margin-top: 40px; }
+  @media (max-width: 600px) { .hide-sm { display: none; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Guard Dashboard</h1>
+  <p class="sub">Säkerhetsnätet i <code>.claude/hooks/guard.py</code> - PreToolUse-hook för Claude Code. Byggd <span id="built"></span>.</p>
+
+  <div class="summary" id="summary"></div>
+
+  <h2>Senaste testkörning</h2>
+  <div id="tests"></div>
+
+  <h2>Regler</h2>
+  <p class="sub">Tre nivåer: <span class="lvl allow">allow</span> släpper igenom till Claude Codes vanliga behörighetsflöde,
+  <span class="lvl ask">ask</span> stoppar och frågar, <span class="lvl deny">deny</span> är hårt stopp. Inbäddade kommandon packas upp och bedöms med samma regler.</p>
+  <div id="rules"></div>
+
+  <footer>hw8-k3s - klustret körs på k3s med 3 control-plane-noder och 3 workers i Multipass. Sidan serveras av nginx:alpine via ConfigMap och Traefik-ingress på guard.local.</footer>
+</main>
+<script id="data" type="application/json">__DATA_JSON__</script>
+<script>
+(function () {
+  var data = JSON.parse(document.getElementById("data").textContent);
+  var esc = function (s) { return String(s).replace(/[&<>"]/g, function (c) { return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]; }); };
+  var lvl = function (l) { return '<span class="lvl ' + l + '">' + l + '</span>'; };
+
+  document.getElementById("built").textContent = data.built;
+
+  var t = data.tests, counts = {deny: 0, ask: 0, allow: 0};
+  data.rule_sets.forEach(function (rs) { rs.rules.forEach(function (r) { counts[r.level]++; }); });
+  data.notes.forEach(function (n) { counts[n.level]++; });
+  var passed = t.ok === t.total;
+  document.getElementById("summary").innerHTML =
+    '<div class="pill ' + (passed ? "pass" : "fail") + '"><b>' + t.ok + ' / ' + t.total + '</b><span>testfall OK (' + t.legacy + ' från hw6 + ' + (t.total - t.legacy) + ' från hw8)</span></div>' +
+    '<div class="pill"><b>' + counts.deny + '</b><span>deny-regler</span></div>' +
+    '<div class="pill"><b>' + counts.ask + '</b><span>ask-regler</span></div>' +
+    '<div class="pill"><b>' + counts.allow + '</b><span>allow-undantag</span></div>' +
+    '<div class="pill"><b>' + esc(t.ts || "-") + '</b><span>testkörning (UTC)</span></div>';
+
+  var rows = t.cases.map(function (c) {
+    return '<tr class="' + (c.ok ? "ok" : "fail") + '"><td class="mark ' + (c.ok ? "ok" : "fail") + '">' + (c.ok ? "OK" : "FEL") + '</td>' +
+      '<td>' + lvl(c.actual) + '</td><td class="hide-sm">' + lvl(c.expected) + '</td>' +
+      '<td><code>' + esc(c.shown) + '</code>' + (c.tool !== "Bash" ? ' <small>(' + esc(c.tool) + ')</small>' : '') + '</td>' +
+      '<td class="hide-sm">' + esc(c.reason || "") + '</td></tr>';
+  }).join("");
+  document.getElementById("tests").innerHTML =
+    '<table><thead><tr><th></th><th>Beslut</th><th class="hide-sm">Förväntat</th><th>Kommando / fil</th><th class="hide-sm">Skäl</th></tr></thead><tbody>' + rows + '</tbody></table>';
+
+  var html = "";
+  data.rule_sets.forEach(function (rs) {
+    html += '<h3>' + esc(rs.name) + '</h3><table><thead><tr><th>Nivå</th><th>Mönster (regex)</th><th>Skäl</th></tr></thead><tbody>' +
+      rs.rules.map(function (r) { return '<tr><td>' + lvl(r.level) + '</td><td><code>' + esc(r.pattern) + '</code></td><td>' + esc(r.reason) + '</td></tr>'; }).join("") +
+      '</tbody></table>';
+  });
+  html += '<h3>Regler som är funktioner</h3><table><thead><tr><th>Nivå</th><th>Beskrivning</th></tr></thead><tbody>' +
+    data.notes.map(function (n) { return '<tr><td>' + lvl(n.level) + '</td><td>' + esc(n.text) + '</td></tr>'; }).join("") + '</tbody></table>';
+  html += '<h3>Känsliga filer</h3><p class="sub">Att läsa/kopiera ut = deny, att nämna = ask.</p><p>' +
+    data.sensitive.map(function (p) { return '<code>' + esc(p) + '</code>'; }).join(" &nbsp; ") + '</p>';
+  document.getElementById("rules").innerHTML = html;
+})();
+</script>
+</body>
+</html>
