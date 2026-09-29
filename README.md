@@ -66,7 +66,7 @@ k8s/deploy-dashboard.sh      bygger index.html, skapar ConfigMap, applicerar
 app/build.py                 läser guardens regler + kör testerna, renderar app/template.html
 app/index.html               GENERERAS av build.py
 .claude/hooks/guard.py       säkerhetsnätet (PreToolUse-hook), aktivt via .claude/settings.json
-.claude/hooks/test_guard.py  136 testfall (32 från hw6 + 104 från hw8)
+.claude/hooks/test_guard.py  212 testfall (32 från hw6 + 180 från hw8)
 kubeconfig                   HÄMTAS av playbooken (gitignored, 0600)
 ```
 
@@ -189,7 +189,7 @@ och `bash -c "..."` bedöms på det inre kommandot. Självskyddet gäller även
 Bash (`cat > .claude/hooks/guard.py`, `tee`, `cp`, `sed -i` blockeras).
 
 ```bash
-python3 .claude/hooks/test_guard.py          # 136/136 testfall gav förväntat beslut.
+python3 .claude/hooks/test_guard.py          # 212/212 testfall gav förväntat beslut.
 python3 .claude/hooks/test_guard.py --json   # används av app/build.py
 ```
 
@@ -197,12 +197,55 @@ Hook-filerna får inte skrivas av agenten (guarden blockerar det själv).
 Ändringar tas fram i `.claude/hooks-proposed/`, granskas och kopieras över
 manuellt. Guardens beslut loggas till `.claude/hooks/audit-log.jsonl`.
 
-Pågående förslag i `.claude/hooks-proposed/` (rev 2, 195 testfall): omslag med
-argument skalas bort korrekt (`timeout 30 cmd`, `script -q /dev/null cmd`,
-`nice -n 10 cmd`, `xargs -n 1 cmd`, `sudo -u root cmd`), `kubectl config view
---raw` och `kubectl get secret -o yaml/json/jsonpath` ger DENY, och
-självskyddet i Bash reagerar bara när skrivningens mål är en hook-fil
-(`diff .claude/hooks/guard.py x 2>/dev/null` är då tillåtet).
+### Guardens versioner
+
+- **hw6** - grundversionen: git-historik, prod/deploy, katastrofalt,
+  hemligheter, e-post, självskydd för Write/Edit. 32 testfall.
+- **hw8 rev 1** - Kubernetes/k3s/Multipass-regler, uppackning av inbäddade
+  kommandon, självskydd även i Bash, kubectl apply-policy. 136 testfall.
+- **hw8 rev 2** - tre hål som upptäcktes när rev 1 var aktiv, plus fyra som
+  hittades i granskningen av rev 2 innan den kopierades in. 212 testfall.
+
+**De tre hålen i rev 1** märktes under arbetet. Omslag med argument
+(`timeout 30 cat .env`, `script -q /dev/null cat kubeconfig`) skalades bort
+fel så att programmet blev `30` eller `/dev/null` i stället för `cat`, och
+resultatet blev ASK i stället för DENY. `kubectl config view --raw` och
+`kubectl get secret -o yaml` läste ut hemligheter utan att träffa något
+mönster. Och självskyddet i Bash reagerade på vilket `>` som helst i ett
+kommando som nämnde en hook-fil, så `diff .claude/hooks/guard.py x
+2>/dev/null` gav DENY. Det sista stoppade agenten tre gånger under
+arbetet, bland annat ett commit-meddelande som nämnde kubeconfig.
+
+**De fyra hålen i rev 2** hittades i en granskning innan inkopieringen.
+Magnus föreslog fyra kommandon som alla skulle ge DENY och bad agenten
+testa dem mot staging-versionen:
+
+```
+cd .claude/hooks && echo x > guard.py
+cd .claude && cp x hooks/guard.py
+cp -t .claude/hooks/ x
+mv --target-directory=.claude/hooks x
+```
+
+Alla fyra släpptes igenom. Orsakerna var tre: delkommandon bedömdes var
+för sig, så efter ett `cd` såg `echo x > guard.py` ofarligt ut (samma hål
+gällde känsliga filer: `cd /var/lib/rancher/k3s/server && sudo cat token`
+passerade). `cp`/`mv` tog sista positionella argumentet som destination,
+vilket med `-t DIR` är källfilen. Och mönstret `\.claude/hooks/` krävde ett
+avslutande snedstreck, som `--target-directory=.claude/hooks` saknar.
+
+Tätningen: `_track_cd` följer `cd`/`pushd` inom raden och `_expand` tolkar
+relativa sökvägar (argument och redirect-mål) mot den katalogen, för både
+självskyddet och känsliga filer. `-t`/`--target-directory` räknas som
+destination. Mönstret blev `\.claude/hooks(?:/|$)`, som träffar
+`.claude/hooks` men inte `.claude/hooks-proposed`. 17 nya testfall, varav
+fem som visar att `cd` inte ger falska larm (`cd .claude/hooks && cat
+guard.py`, `cd .claude/hooks && cd - && echo x > guard.py`).
+
+Arbetssättet är poängen: guarden blockerar agenten från att skriva i
+`.claude/hooks/`, så varje ny version går via `.claude/hooks-proposed/`,
+körs mot testsviten där, granskas med riktade motexempel, och kopieras in
+manuellt. Rev 2 hade inte tätats utan den granskningen.
 
 ### Kända begränsningar i guarden
 
@@ -284,7 +327,7 @@ De tre som bäst visar setupen:
    ![pod-placering](screenshots/03-pod-placering.png)
 
 3. **Dashboarden via Traefik i Chrome.** `http://guard.local`, grön testkörning
-   136/136, serverad av nginx:alpine ur en ConfigMap.
+   212/212, serverad av nginx:alpine ur en ConfigMap.
 
    ![dashboard i browsern](screenshots/07-dashboard-i-browsern.png)
 

@@ -43,7 +43,10 @@ Historik:
                  sudo -u root cmd), kubectl config view --raw och
                  kubectl get secret -o yaml/json = DENY, självskyddet i Bash
                  reagerar bara när redirect-MÅLET (inte 2>/dev/null) eller
-                 destinationen för cp/mv/tee är en hook-fil
+                 destinationen för cp/mv/tee är en hook-fil.
+                 Relativa sökvägar tolkas mot "cd"/"pushd" tidigare på samma
+                 rad (cd .claude/hooks && echo x > guard.py), cp/mv med
+                 -t/--target-directory, och .claude/hooks utan snedstreck.
 
 Referens: https://code.claude.com/docs/en/hooks
 """
@@ -179,7 +182,7 @@ KUBECONFIG_USERS = {"kubectl", "helm", "k9s", "kustomize", "ansible-playbook", "
 
 # Självskydd - agenten får inte skriva om sitt eget skyddsnät.
 SELF_PROTECT = [
-    r"\.claude/hooks/", r"\.claude/settings(\.local)?\.json\b",
+    r"\.claude/hooks(?:/|$)", r"\.claude/settings(\.local)?\.json\b",
 ]
 # ...inte heller via Bash. Reagerar bara när MÅLET är en hook-fil: redirect-mål
 # (inte 2>/dev/null), destinationen för cp/mv/install/rsync/ln, alla argument
@@ -366,6 +369,25 @@ def _redirect_targets(raw):
     return [m for m in _REDIRECT.findall(raw) if not m.startswith("&")]
 
 
+def _expand(token, cwd):
+    """Tolka en relativ sökväg mot ett cd tidigare på raden."""
+    if cwd and token and not token.startswith(("-", "/", "~", "$")):
+        return os.path.normpath(os.path.join(cwd, token))
+    return token
+
+
+def _track_cd(tokens, cwd):
+    """Uppdatera arbetskatalogen om delkommandot är cd/pushd."""
+    if _prog(tokens) not in ("cd", "pushd"):
+        return cwd
+    target = next((t for t in tokens[1:] if not t.startswith("-")), None)
+    if target is None or target == "-":
+        return None
+    if target.startswith(("/", "~", "$")):
+        return target
+    return os.path.normpath(os.path.join(cwd or "", target))
+
+
 def _writes_out(raw):
     """Finns en redirect till något annat än /dev/null eller en fd?"""
     return any(t != "/dev/null" for t in _redirect_targets(raw))
@@ -449,23 +471,29 @@ def _protected(text):
     return any(re.search(p, text) for p in SELF_PROTECT)
 
 
-def _self_protect_bash(raw, tokens):
+def _self_protect_bash(raw, tokens, cwd=None):
     """Bash-varianten av självskyddet: DENY bara när MÅLET för en skrivning
     är en hook-fil. Läsning (cat, diff, python3 test_guard.py) och
-    2>/dev/null är tillåtet."""
-    if not _protected(raw):
-        return (ALLOW, "")
+    2>/dev/null är tillåtet. Relativa sökvägar tolkas mot ett cd tidigare
+    på raden, och cp/mv -t/--target-directory räknas som destination."""
     prog = _prog(tokens)
-    args = [t for t in tokens[1:] if not t.startswith("-")]
+    redirects = [_expand(t, cwd) for t in _redirect_targets(raw)]
+    allargs = [_expand(t, cwd) for t in tokens[1:]]
+    positional = [_expand(t, cwd) for t in tokens[1:] if not t.startswith("-")]
+    target_dirs = [_expand(v, cwd) for v in _flag_values(tokens, ("-t", "--target-directory"))]
+    if not any(_protected(x) for x in [raw] + redirects + allargs + target_dirs):
+        return (ALLOW, "")
     deny = (DENY, "agenten får inte skriva om sitt eget skyddsnät via Bash")
-    if any(_protected(t) for t in _redirect_targets(raw)):
+    if any(_protected(t) for t in redirects):
         return deny
-    if prog in DEST_VERBS and args and _protected(args[-1]):
-        return deny
-    if prog in INPLACE_VERBS and any(_protected(t) for t in tokens[1:]):
+    if prog in DEST_VERBS:
+        dest = target_dirs[-1] if target_dirs else (positional[-1] if positional else "")
+        if _protected(dest):
+            return deny
+    if prog in INPLACE_VERBS and any(_protected(t) for t in allargs):
         return deny
     if prog == "sed" and any(t.startswith("-i") or t == "--in-place" for t in tokens[1:]) \
-            and any(_protected(a) for a in args):
+            and any(_protected(a) for a in positional):
         return deny
     if prog in SCRIPT_VERBS and any(t in ("-c", "-e") for t in tokens[1:]):
         return deny
@@ -510,13 +538,13 @@ def _unwrap(tokens):
     return None
 
 
-def _classify_subcommand(raw, tokens):
+def _classify_subcommand(raw, tokens, cwd=None):
     result = (ALLOW, "")
 
     # katastrofalt + rm + självskydd först (starkast)
     result = _worse(result, _match_list(raw, CATASTROPHIC))
     result = _worse(result, _rm_decision(tokens))
-    result = _worse(result, _self_protect_bash(raw, tokens))
+    result = _worse(result, _self_protect_bash(raw, tokens, cwd))
     if result[0] == DENY:
         return result
 
@@ -535,7 +563,11 @@ def _classify_subcommand(raw, tokens):
     patterns = SENSITIVE
     if prog in KUBECONFIG_USERS:
         patterns = [p for p in SENSITIVE if p not in KUBECONFIG_FILES]
-    if _sensitive_hit(raw, patterns):
+    # relativa sökvägar efter "cd /var/lib/rancher/k3s/server && cat token"
+    sensitive_text = raw
+    if cwd:
+        sensitive_text = raw + " " + " ".join(_expand(t, cwd) for t in tokens[1:])
+    if _sensitive_hit(sensitive_text, patterns):
         if prog in READ_VERBS or _writes_out(raw):
             result = _worse(result, (DENY, "läser/kopierar ut en hemlighetsfil"))
         else:
@@ -554,8 +586,10 @@ def _check_bash(command, depth=0):
     result = _match_list(command, CATASTROPHIC)
     if result[0] == DENY:
         return result
+    cwd = None  # följer cd/pushd så att relativa sökvägar bedöms rätt
     for raw, tokens in _sub_commands(command):
-        result = _worse(result, _classify_subcommand(raw, tokens))
+        result = _worse(result, _classify_subcommand(raw, tokens, cwd))
+        cwd = _track_cd(tokens, cwd)
         if result[0] == DENY:
             break
         # packa upp inbäddat kommando och bedöm det med samma regler

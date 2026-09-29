@@ -190,6 +190,99 @@ CASES = [
     ("Bash", {"command": "chmod 000 .claude/hooks/guard.py"}, guard.DENY),
     ("Write", {"file_path": ".claude/hooks-proposed/guard.py"}, guard.ALLOW),
     ("Bash", {"command": "python3 .claude/hooks-proposed/test_guard.py"}, guard.ALLOW),
+
+    # =====================================================================
+    # hw08 rev 2: tre hål
+    # =====================================================================
+
+    # --- hål 1: omslag med argument (timeout, script, nice, xargs, sudo -u ...) ---
+    ("Bash", {"command": "timeout 30 cat .env"}, guard.DENY),
+    ("Bash", {"command": "timeout -s KILL 10 multipass purge"}, guard.DENY),
+    ("Bash", {"command": "timeout --foreground 5 cat kubeconfig"}, guard.DENY),
+    ("Bash", {"command": "script -q /dev/null cat kubeconfig"}, guard.DENY),
+    ("Bash", {"command": "script -q -c \"cat kubeconfig\" /dev/null"}, guard.DENY),
+    ("Bash", {"command": "script -q /dev/null ansible-playbook site.yml"}, guard.ASK),
+    ("Bash", {"command": "nice -n 10 cat .env"}, guard.DENY),
+    ("Bash", {"command": "nice -10 kubectl delete node agent1"}, guard.DENY),
+    ("Bash", {"command": "nohup cat kubeconfig"}, guard.DENY),
+    ("Bash", {"command": "time cat /var/lib/rancher/k3s/server/token"}, guard.DENY),
+    ("Bash", {"command": "xargs -n 1 cat kubeconfig"}, guard.DENY),
+    ("Bash", {"command": "xargs -I{} cat {} .env"}, guard.DENY),
+    ("Bash", {"command": "sudo -u root cat /etc/rancher/k3s/config.yaml"}, guard.DENY),
+    ("Bash", {"command": "sudo -- cat .env"}, guard.DENY),
+    ("Bash", {"command": "env -i cat .env"}, guard.DENY),
+    ("Bash", {"command": "command cat .env"}, guard.DENY),
+    ("Bash", {"command": "timeout 60 nice -n 5 sudo -u root cat kubeconfig"}, guard.DENY),
+    ("Bash", {"command": "ssh server1 \"timeout 10 sudo cat /var/lib/rancher/k3s/server/token\""}, guard.DENY),
+    ("Bash", {"command": "su - root -c 'cat /etc/rancher/k3s/k3s.yaml'"}, guard.DENY),
+    # omslag ska inte ge falska larm
+    ("Bash", {"command": "timeout 60 kubectl get nodes"}, guard.ALLOW),
+    ("Bash", {"command": "script -q /dev/null ansible-playbook site.yml --syntax-check"}, guard.ALLOW),
+    ("Bash", {"command": "time python3 .claude/hooks/test_guard.py"}, guard.ALLOW),
+    ("Bash", {"command": "nice -n 10 python3 app/build.py"}, guard.ALLOW),
+
+    # --- hål 2: kubectl config view --raw, kubectl get secret -o yaml/json ---
+    ("Bash", {"command": "kubectl config view --raw"}, guard.DENY),
+    ("Bash", {"command": "kubectl --kubeconfig kubeconfig config view --raw -o json"}, guard.DENY),
+    ("Bash", {"command": "kubectl get secret k3s-serving -n kube-system -o yaml"}, guard.DENY),
+    ("Bash", {"command": "kubectl get secrets -A -o json"}, guard.DENY),
+    ("Bash", {"command": "kubectl get secret x -ojsonpath='{.data.token}'"}, guard.DENY),
+    ("Bash", {"command": "kubectl get secret/x --output=yaml"}, guard.DENY),
+    ("Bash", {"command": "kubectl get -o yaml secret x"}, guard.DENY),
+    ("Bash", {"command": "kubectl get secret x -o go-template='{{.data}}'"}, guard.DENY),
+    ("Bash", {"command": "ssh server1 \"sudo k3s kubectl get secret -A -o yaml\""}, guard.DENY),
+    ("Bash", {"command": "multipass exec server1 -- sudo k3s kubectl config view --raw"}, guard.DENY),
+    # metadata om secrets är ok
+    ("Bash", {"command": "kubectl config view"}, guard.ALLOW),
+    ("Bash", {"command": "kubectl config current-context"}, guard.ALLOW),
+    ("Bash", {"command": "kubectl get secrets -n guard"}, guard.ALLOW),
+    ("Bash", {"command": "kubectl get secret x -o wide"}, guard.ALLOW),
+    ("Bash", {"command": "kubectl get secret x -o name"}, guard.ALLOW),
+    ("Bash", {"command": "kubectl describe secret x -n guard"}, guard.ALLOW),
+    ("Bash", {"command": "kubectl get pods -o yaml"}, guard.ALLOW),
+    ("Bash", {"command": "kubectl get pods -o yaml -n secrets-ns"}, guard.ALLOW),
+
+    # --- hål 3: självskyddet i Bash reagerar bara på skrivningens MÅL ---
+    ("Bash", {"command": "diff .claude/hooks/guard.py .claude/hooks-proposed/guard.py 2>/dev/null"}, guard.ALLOW),
+    ("Bash", {"command": "diff -q .claude/hooks/guard.py .claude/hooks-proposed/guard.py 2>&1 | head"}, guard.ALLOW),
+    ("Bash", {"command": "cat .claude/hooks/guard.py > /tmp/copy.py"}, guard.ALLOW),
+    ("Bash", {"command": "cp .claude/hooks/guard.py /tmp/"}, guard.ALLOW),
+    ("Bash", {"command": "python3 .claude/hooks/test_guard.py --json > app/results.json"}, guard.ALLOW),
+    ("Bash", {"command": "grep -n DENY .claude/hooks/guard.py 2>/dev/null | wc -l"}, guard.ALLOW),
+    ("Bash", {"command": "cat /tmp/x > .claude/hooks/guard.py"}, guard.DENY),
+    ("Bash", {"command": "echo x 2>&1 >> .claude/settings.json"}, guard.DENY),
+    ("Bash", {"command": "cat /tmp/x &> .claude/hooks/guard.py"}, guard.DENY),
+    ("Bash", {"command": "cat /tmp/x 1>.claude/hooks/guard.py"}, guard.DENY),
+    ("Bash", {"command": "cp /tmp/x .claude/hooks/guard.py"}, guard.DENY),
+    ("Bash", {"command": "rsync -a /tmp/hooks/ .claude/hooks/"}, guard.DENY),
+    ("Bash", {"command": "tee -a .claude/hooks/guard.py < /tmp/x"}, guard.DENY),
+    ("Bash", {"command": "truncate -s 0 .claude/hooks/guard.py"}, guard.DENY),
+    ("Bash", {"command": "dd if=/tmp/x of=.claude/hooks/guard.py"}, guard.DENY),
+    ("Bash", {"command": "timeout 5 tee .claude/settings.json < /tmp/x"}, guard.DENY),
+    # samma princip för känsliga filer: 2>/dev/null är inte en utläsning
+    ("Bash", {"command": "ls -la ~/.ssh/ 2>/dev/null"}, guard.ASK),
+    ("Bash", {"command": "ls -la ~/.ssh/ > list.txt"}, guard.DENY),
+
+    # --- självskydd: cd tidigare på raden, -t/--target-directory, utan snedstreck ---
+    ("Bash", {"command": "cd .claude/hooks && echo x > guard.py"}, guard.DENY),
+    ("Bash", {"command": "cd .claude && cp x hooks/guard.py"}, guard.DENY),
+    ("Bash", {"command": "cp -t .claude/hooks/ x"}, guard.DENY),
+    ("Bash", {"command": "mv --target-directory=.claude/hooks x"}, guard.DENY),
+    ("Bash", {"command": "cp --target-directory .claude/hooks x"}, guard.DENY),
+    ("Bash", {"command": "cd .claude/hooks; sed -i '' 's/DENY/ASK/' guard.py"}, guard.DENY),
+    ("Bash", {"command": "pushd .claude && tee hooks/guard.py < /tmp/x"}, guard.DENY),
+    ("Bash", {"command": "cd .claude/hooks && cd .. && echo x > settings.json"}, guard.DENY),
+    ("Bash", {"command": "cd .claude/hooks-proposed && cp guard.py ../hooks/"}, guard.DENY),
+    ("Bash", {"command": "cd .claude && rm hooks/guard.py"}, guard.DENY),
+    # cd + känslig fil med relativ sökväg
+    ("Bash", {"command": "cd /var/lib/rancher/k3s/server && sudo cat token"}, guard.DENY),
+    ("Bash", {"command": "ssh server1 'cd /etc/rancher/k3s && sudo cat k3s.yaml'"}, guard.DENY),
+    # cd ska inte ge falska larm
+    ("Bash", {"command": "cd .claude/hooks && cat guard.py"}, guard.ALLOW),
+    ("Bash", {"command": "cd .claude/hooks && python3 test_guard.py"}, guard.ALLOW),
+    ("Bash", {"command": "cd .claude/hooks-proposed && echo x > guard.py"}, guard.ALLOW),
+    ("Bash", {"command": "cd ansible && ansible-playbook site.yml --syntax-check"}, guard.ALLOW),
+    ("Bash", {"command": "cd .claude/hooks && cd - && echo x > guard.py"}, guard.ALLOW),
 ]
 
 LEGACY_COUNT = 32  # de ursprungliga fallen från homework-06, alltid först i listan

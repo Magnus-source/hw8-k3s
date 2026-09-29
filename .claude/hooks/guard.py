@@ -38,6 +38,15 @@ Historik:
     homework-06  grundversion (git, prod, katastrofalt, hemligheter, e-post)
     homework-08  Kubernetes/k3s/Multipass-regler, uppackning av inbäddade
                  kommandon, självskydd även i Bash, kubectl apply-policy
+    hw08 rev 2   omslag med argument skalas bort korrekt (timeout 30 cmd,
+                 script -q /dev/null cmd, nice -n 10 cmd, xargs -n 1 cmd,
+                 sudo -u root cmd), kubectl config view --raw och
+                 kubectl get secret -o yaml/json = DENY, självskyddet i Bash
+                 reagerar bara när redirect-MÅLET (inte 2>/dev/null) eller
+                 destinationen för cp/mv/tee är en hook-fil.
+                 Relativa sökvägar tolkas mot "cd"/"pushd" tidigare på samma
+                 rad (cd .claude/hooks && echo x > guard.py), cp/mv med
+                 -t/--target-directory, och .claude/hooks utan snedstreck.
 
 Referens: https://code.claude.com/docs/en/hooks
 """
@@ -104,6 +113,9 @@ KUBERNETES = [
     (DENY, r"\bk3s-uninstall\.sh\b",                               "k3s-uninstall på en server river control plane/etcd"),
     (DENY, r"\bmultipass\b\s+delete\b.*(?:\s--purge\b|\s-p\b)",   "multipass delete --purge utanför destroy-skriptet"),
     (DENY, r"\bmultipass\b\s+purge\b",                             "multipass purge raderar VM:ar permanent"),
+    (DENY, r"\bkubectl\b.*\bconfig\b\s+view\b.*--raw\b",           "kubectl config view --raw skriver ut kubeconfig med klientnyckel"),
+    (DENY, r"\bkubectl\b(?=.*\bget\b)(?=.*\bsecrets?(?:\.v1)?(?:\s|/|$))(?=.*(?:\s-o|--output)[=\s]*(?:ya?ml|json|jsonpath|go-template|template|custom-columns))",
+                                                                   "kubectl get secret -o yaml/json/jsonpath läser ut hemligheter"),
     (ASK,  r"\bkubectl\b.*\bdelete\b",                             "kubectl delete i eget namespace"),
     (ASK,  r"\bkubectl\b.*\bdrain\b",                              "drain tömmer en nod på pods"),
     (ASK,  r"\bkubectl\b.*\bcordon\b",                             "cordon stänger en nod för schemaläggning"),
@@ -170,11 +182,13 @@ KUBECONFIG_USERS = {"kubectl", "helm", "k9s", "kustomize", "ansible-playbook", "
 
 # Självskydd - agenten får inte skriva om sitt eget skyddsnät.
 SELF_PROTECT = [
-    r"\.claude/hooks/", r"\.claude/settings(\.local)?\.json\b",
+    r"\.claude/hooks(?:/|$)", r"\.claude/settings(\.local)?\.json\b",
 ]
-# ...inte heller via Bash: redirect, kopiering, in-place-redigering osv.
-WRITE_VERBS = {"tee", "cp", "mv", "install", "rsync", "truncate", "dd", "ln",
-               "chmod", "chown", "rm", "patch", "shred"}
+# ...inte heller via Bash. Reagerar bara när MÅLET är en hook-fil: redirect-mål
+# (inte 2>/dev/null), destinationen för cp/mv/install/rsync/ln, alla argument
+# till tee/rm/chmod/chown/truncate/patch/shred/dd, sed -i, eller python -c.
+DEST_VERBS = {"cp", "mv", "install", "rsync", "ln"}
+INPLACE_VERBS = {"tee", "truncate", "dd", "chmod", "chown", "rm", "patch", "shred"}
 SCRIPT_VERBS = {"python", "python3", "perl", "ruby", "node"}
 
 # Bonus (överkurs): direkt e-postutskick blockeras och styrs om till verktyget
@@ -204,7 +218,9 @@ POLICY_NOTES = [
     (ALLOW, "kubectl apply -f med fil under k8s/"),
     (ASK,  "kubectl apply med --prune, URL, stdin (-f -), fil utanför k8s/, utan -f, eller mot kube-system"),
     (ASK,  "ansible-playbook utan --limit/-l (hela inventoryt); --check/--syntax-check/--list-* är alltid tillåtna"),
-    (DENY, "Skriva till .claude/hooks/ eller .claude/settings.json via Write/Edit eller Bash (>, tee, cp, mv, sed -i, python -c ...)"),
+    (DENY, "Skriva till .claude/hooks/ eller .claude/settings.json via Write/Edit eller Bash när målet är en hook-fil (redirect-mål, cp/mv-destination, tee, sed -i, rm, python -c). 2>/dev/null och läsning är tillåtet"),
+    (DENY, "kubectl config view --raw samt kubectl get secret -o yaml/json/jsonpath (läser ut hemligheter)"),
+    (ALLOW, "Omslag skalas bort innan bedömning: sudo -u x, env, nice -n, nohup, time, timeout N, script -q fil, script -c, xargs -n, command"),
     (DENY, "Skicka e-post direkt (gmail-API, sendmail, smtplib) eller via andra mail-verktyg än safe_email"),
     (ALLOW, "Inbäddade kommandon (ssh host \"...\", multipass exec vm -- ..., kubectl exec pod -- sh -c \"...\", bash -c \"...\") packas upp och det inre kommandot bedöms med samma regler"),
 ]
@@ -215,8 +231,26 @@ POLICY_NOTES = [
 # ---------------------------------------------------------------------------
 
 _SEPS = re.compile(r"\s*(?:\|\||&&|\||;|&)\s*")
-_WRAPPERS = {"sudo", "env", "nice", "nohup", "time", "xargs", "command"}
 _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# Omslag som kör ett annat kommando: (flaggor som tar ett argument, antal
+# positionella argument före själva kommandot). "timeout 30 cmd" har 1
+# positionellt (tiden), "script -q /dev/null cmd" har 1 (typescript-filen).
+_WRAPPER_SPEC = {
+    "sudo":    ({"-u", "-g", "-p", "-C", "-D", "-h", "-r", "-t", "-U", "-T"}, 0),
+    "doas":    ({"-u"}, 0),
+    "env":     ({"-u", "-C", "-S", "--unset", "--chdir"}, 0),
+    "nice":    ({"-n", "--adjustment"}, 0),
+    "nohup":   (set(), 0),
+    "time":    ({"-f", "-o", "--format", "--output"}, 0),
+    "timeout": ({"-s", "-k", "--signal", "--kill-after"}, 1),
+    "script":  ({"-F", "-t", "-E", "-T", "-c"}, 1),
+    "xargs":   ({"-I", "-n", "-P", "-d", "-L", "-s", "-E", "-a", "-J", "-R", "-S"}, 0),
+    "stdbuf":  ({"-i", "-o", "-e"}, 0),
+    "command": (set(), 0),
+}
+# Redirect-mål i en rå kommandosträng: "> fil", ">> fil", "2> fil", "&> fil".
+# Fd-dubbleringar (2>&1, >&2) filtreras bort.
+_REDIRECT = re.compile(r"(?<![<>])(?:\d*>>?|&>>?)\s*([^\s|&;<>]+)")
 _SHELLS = {"sh", "bash", "zsh", "dash", "ash"}
 # ssh-flaggor som tar ett argument (så vi hittar rätt host-token)
 _SSH_OPTS_WITH_ARG = {"-i", "-p", "-l", "-o", "-F", "-J", "-L", "-R", "-D",
@@ -294,11 +328,69 @@ def _sub_commands(command):
             tokens = shlex.split(part)
         except ValueError:
             tokens = part.split()
-        # skala bort miljövariabler (KUBECONFIG=... kubectl) och wrappers (sudo, env, ...)
-        while tokens and (_ENV_ASSIGN.match(tokens[0]) or os.path.basename(tokens[0]) in _WRAPPERS):
-            tokens = tokens[1:]
-        out.append((part, tokens))
+        out.append((part, _strip_wrappers(tokens)))
     return out
+
+
+def _strip_wrappers(tokens):
+    """Skala bort miljövariabler (KUBECONFIG=... kubectl) och omslag med
+    deras flaggor och positionella argument (timeout 30 cmd, sudo -u root cmd,
+    script -q /dev/null cmd). "script -c 'cmd' fil" ger cmd:s tokens."""
+    while tokens:
+        if _ENV_ASSIGN.match(tokens[0]):
+            tokens = tokens[1:]
+            continue
+        name = os.path.basename(tokens[0])
+        if name not in _WRAPPER_SPEC:
+            break
+        with_arg, positional = _WRAPPER_SPEC[name]
+        i, script_cmd = 1, None
+        while i < len(tokens) and tokens[i].startswith("-") and tokens[i] != "--":
+            flag = tokens[i]
+            if name == "script" and flag == "-c" and i + 1 < len(tokens):
+                script_cmd = tokens[i + 1]          # Linux: script -c "cmd" fil
+                i += 2
+            elif flag in with_arg and i + 1 < len(tokens):
+                i += 2
+            else:
+                i += 1                              # -q, -E, -n1, --foreground, nice -10
+        if i < len(tokens) and tokens[i] == "--":
+            i += 1
+        if script_cmd is not None:
+            try:
+                return _strip_wrappers(shlex.split(script_cmd))
+            except ValueError:
+                return _strip_wrappers(script_cmd.split())
+        tokens = tokens[i + positional:]
+    return tokens
+
+
+def _redirect_targets(raw):
+    return [m for m in _REDIRECT.findall(raw) if not m.startswith("&")]
+
+
+def _expand(token, cwd):
+    """Tolka en relativ sökväg mot ett cd tidigare på raden."""
+    if cwd and token and not token.startswith(("-", "/", "~", "$")):
+        return os.path.normpath(os.path.join(cwd, token))
+    return token
+
+
+def _track_cd(tokens, cwd):
+    """Uppdatera arbetskatalogen om delkommandot är cd/pushd."""
+    if _prog(tokens) not in ("cd", "pushd"):
+        return cwd
+    target = next((t for t in tokens[1:] if not t.startswith("-")), None)
+    if target is None or target == "-":
+        return None
+    if target.startswith(("/", "~", "$")):
+        return target
+    return os.path.normpath(os.path.join(cwd or "", target))
+
+
+def _writes_out(raw):
+    """Finns en redirect till något annat än /dev/null eller en fd?"""
+    return any(t != "/dev/null" for t in _redirect_targets(raw))
 
 
 def _match_list(text, rules):
@@ -375,17 +467,36 @@ def _ansible_decision(tokens):
     return (ASK, "ansible-playbook mot hela inventoryt - bekräfta")
 
 
-def _self_protect_bash(raw, tokens):
-    """Bash-varianten av självskyddet: skrivning mot hook-filer/settings."""
-    if not any(re.search(p, raw) for p in SELF_PROTECT):
-        return (ALLOW, "")
+def _protected(text):
+    return any(re.search(p, text) for p in SELF_PROTECT)
+
+
+def _self_protect_bash(raw, tokens, cwd=None):
+    """Bash-varianten av självskyddet: DENY bara när MÅLET för en skrivning
+    är en hook-fil. Läsning (cat, diff, python3 test_guard.py) och
+    2>/dev/null är tillåtet. Relativa sökvägar tolkas mot ett cd tidigare
+    på raden, och cp/mv -t/--target-directory räknas som destination."""
     prog = _prog(tokens)
-    writes = (">" in raw
-              or prog in WRITE_VERBS
-              or (prog == "sed" and any(t.startswith("-i") or t == "--in-place" for t in tokens[1:]))
-              or (prog in SCRIPT_VERBS and any(t in ("-c", "-e") for t in tokens[1:])))
-    if writes:
-        return (DENY, "agenten får inte skriva om sitt eget skyddsnät via Bash")
+    redirects = [_expand(t, cwd) for t in _redirect_targets(raw)]
+    allargs = [_expand(t, cwd) for t in tokens[1:]]
+    positional = [_expand(t, cwd) for t in tokens[1:] if not t.startswith("-")]
+    target_dirs = [_expand(v, cwd) for v in _flag_values(tokens, ("-t", "--target-directory"))]
+    if not any(_protected(x) for x in [raw] + redirects + allargs + target_dirs):
+        return (ALLOW, "")
+    deny = (DENY, "agenten får inte skriva om sitt eget skyddsnät via Bash")
+    if any(_protected(t) for t in redirects):
+        return deny
+    if prog in DEST_VERBS:
+        dest = target_dirs[-1] if target_dirs else (positional[-1] if positional else "")
+        if _protected(dest):
+            return deny
+    if prog in INPLACE_VERBS and any(_protected(t) for t in allargs):
+        return deny
+    if prog == "sed" and any(t.startswith("-i") or t == "--in-place" for t in tokens[1:]) \
+            and any(_protected(a) for a in positional):
+        return deny
+    if prog in SCRIPT_VERBS and any(t in ("-c", "-e") for t in tokens[1:]):
+        return deny
     return (ALLOW, "")
 
 
@@ -419,21 +530,21 @@ def _unwrap(tokens):
         if "--" in tokens:
             return _join(tokens[tokens.index("--") + 1:])
         return None
-    if prog in _SHELLS:
+    if prog in _SHELLS or prog == "su":
         for i, t in enumerate(tokens[1:], 1):
-            if t.startswith("-") and not t.startswith("--") and "c" in t[1:]:
+            if t == "-c" or (prog != "su" and t.startswith("-") and not t.startswith("--") and "c" in t[1:]):
                 return tokens[i + 1] if i + 1 < len(tokens) else None
         return None
     return None
 
 
-def _classify_subcommand(raw, tokens):
+def _classify_subcommand(raw, tokens, cwd=None):
     result = (ALLOW, "")
 
     # katastrofalt + rm + självskydd först (starkast)
     result = _worse(result, _match_list(raw, CATASTROPHIC))
     result = _worse(result, _rm_decision(tokens))
-    result = _worse(result, _self_protect_bash(raw, tokens))
+    result = _worse(result, _self_protect_bash(raw, tokens, cwd))
     if result[0] == DENY:
         return result
 
@@ -452,9 +563,12 @@ def _classify_subcommand(raw, tokens):
     patterns = SENSITIVE
     if prog in KUBECONFIG_USERS:
         patterns = [p for p in SENSITIVE if p not in KUBECONFIG_FILES]
-    if _sensitive_hit(raw, patterns):
-        redirect_out = ">" in raw
-        if prog in READ_VERBS or redirect_out:
+    # relativa sökvägar efter "cd /var/lib/rancher/k3s/server && cat token"
+    sensitive_text = raw
+    if cwd:
+        sensitive_text = raw + " " + " ".join(_expand(t, cwd) for t in tokens[1:])
+    if _sensitive_hit(sensitive_text, patterns):
+        if prog in READ_VERBS or _writes_out(raw):
             result = _worse(result, (DENY, "läser/kopierar ut en hemlighetsfil"))
         else:
             result = _worse(result, (ASK, "kommandot rör en känslig fil"))
@@ -472,8 +586,10 @@ def _check_bash(command, depth=0):
     result = _match_list(command, CATASTROPHIC)
     if result[0] == DENY:
         return result
+    cwd = None  # följer cd/pushd så att relativa sökvägar bedöms rätt
     for raw, tokens in _sub_commands(command):
-        result = _worse(result, _classify_subcommand(raw, tokens))
+        result = _worse(result, _classify_subcommand(raw, tokens, cwd))
+        cwd = _track_cd(tokens, cwd)
         if result[0] == DENY:
             break
         # packa upp inbäddat kommando och bedöm det med samma regler

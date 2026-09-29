@@ -262,6 +262,27 @@ CASES = [
     # samma princip för känsliga filer: 2>/dev/null är inte en utläsning
     ("Bash", {"command": "ls -la ~/.ssh/ 2>/dev/null"}, guard.ASK),
     ("Bash", {"command": "ls -la ~/.ssh/ > list.txt"}, guard.DENY),
+
+    # --- självskydd: cd tidigare på raden, -t/--target-directory, utan snedstreck ---
+    ("Bash", {"command": "cd .claude/hooks && echo x > guard.py"}, guard.DENY),
+    ("Bash", {"command": "cd .claude && cp x hooks/guard.py"}, guard.DENY),
+    ("Bash", {"command": "cp -t .claude/hooks/ x"}, guard.DENY),
+    ("Bash", {"command": "mv --target-directory=.claude/hooks x"}, guard.DENY),
+    ("Bash", {"command": "cp --target-directory .claude/hooks x"}, guard.DENY),
+    ("Bash", {"command": "cd .claude/hooks; sed -i '' 's/DENY/ASK/' guard.py"}, guard.DENY),
+    ("Bash", {"command": "pushd .claude && tee hooks/guard.py < /tmp/x"}, guard.DENY),
+    ("Bash", {"command": "cd .claude/hooks && cd .. && echo x > settings.json"}, guard.DENY),
+    ("Bash", {"command": "cd .claude/hooks-proposed && cp guard.py ../hooks/"}, guard.DENY),
+    ("Bash", {"command": "cd .claude && rm hooks/guard.py"}, guard.DENY),
+    # cd + känslig fil med relativ sökväg
+    ("Bash", {"command": "cd /var/lib/rancher/k3s/server && sudo cat token"}, guard.DENY),
+    ("Bash", {"command": "ssh server1 'cd /etc/rancher/k3s && sudo cat k3s.yaml'"}, guard.DENY),
+    # cd ska inte ge falska larm
+    ("Bash", {"command": "cd .claude/hooks && cat guard.py"}, guard.ALLOW),
+    ("Bash", {"command": "cd .claude/hooks && python3 test_guard.py"}, guard.ALLOW),
+    ("Bash", {"command": "cd .claude/hooks-proposed && echo x > guard.py"}, guard.ALLOW),
+    ("Bash", {"command": "cd ansible && ansible-playbook site.yml --syntax-check"}, guard.ALLOW),
+    ("Bash", {"command": "cd .claude/hooks && cd - && echo x > guard.py"}, guard.ALLOW),
 ]
 
 LEGACY_COUNT = 32  # de ursprungliga fallen från homework-06, alltid först i listan
